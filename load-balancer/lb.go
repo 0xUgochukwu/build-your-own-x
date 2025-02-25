@@ -6,7 +6,65 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 )
+
+var (
+	servers       []string
+	activeServers []string
+	serverIndex   uint32
+	healthPeriod  time.Duration
+	mu            sync.RWMutex
+)
+
+func getNextServer() string {
+	mu.RLock()
+	defer mu.RUnlock()
+
+	if len(activeServers) == 0 {
+		return ""
+	}
+
+	index := atomic.AddUint32(&serverIndex, 1) - 1
+	return activeServers[index%uint32(len(activeServers))]
+}
+
+func checkHealth() {
+	ticker := time.NewTicker(healthPeriod)
+	defer ticker.Stop()
+
+	for {
+		<-ticker.C
+		mu.Lock()
+
+		healthyServers := []string{}
+
+		var wg sync.WaitGroup
+
+		for _, server := range servers {
+			wg.Add(1)
+
+			go func(server string) {
+				defer wg.Done()
+				res, err := http.Get(server)
+
+				if err == nil && res.StatusCode == http.StatusOK {
+					healthyServers = append(healthyServers, server)
+				}
+			}(server)
+
+		}
+		wg.Wait()
+
+		activeServers = healthyServers
+		mu.Unlock()
+	}
+}
 
 func handleRequest(w http.ResponseWriter, r *http.Request) {
 	fmt.Printf("Request received from %s\n", r.RemoteAddr)
@@ -24,8 +82,12 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	r.Body = io.NopCloser(bytes.NewReader(body))
 
-	url := fmt.Sprintf("%s://%s%s", "http", "localhost:8080", r.RequestURI)
+	server := getNextServer()
+	if server == "" {
+		http.Error(w, "Bad Gateway", http.StatusBadGateway)
+	}
 
+	url := fmt.Sprintf("%s%s", server, r.RequestURI)
 	proxyReq, err := http.NewRequest(r.Method, url, bytes.NewReader(body))
 	proxyReq.Header = r.Header
 
@@ -54,9 +116,26 @@ func handleRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		go handleRequest(w, r)
-	})
+	hosts := os.Getenv("HOSTS")
+	if hosts == "" {
+		panic("HOSTS environment variable is required")
+	}
+
+	if len(os.Args) != 2 {
+		panic("Specify health check period")
+	}
+
+	period, e := strconv.Atoi(os.Args[1])
+	if e != nil {
+		panic("Spicify valid number in seconds for check period")
+	}
+
+	servers = strings.Split(hosts, ",")
+	healthPeriod = time.Duration(period) * time.Second
+
+	go checkHealth()
+
+	http.HandleFunc("/", handleRequest)
 
 	err := http.ListenAndServe(":80", nil)
 
